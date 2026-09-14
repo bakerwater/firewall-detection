@@ -27,6 +27,11 @@ env/
 *.webm
 *.jsonl
 
+# Second-stage training artifacts
+/verifier_candidates/
+/weights/
+*.npz
+
 # Keep only the deployable YOLO weight from the training run
 /yolo26s-p2-1024-recall/*
 !/yolo26s-p2-1024-recall/weights/

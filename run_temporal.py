@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from temporal_gates import FireSmokePostprocessor, load_config
-
+from temporal_gates import FireSmokePostprocessor, PostprocessorConfig, load_config
+from video_io import prepare_video_source
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -25,14 +27,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-fps", type=float, default=5.0)
     parser.add_argument("--imgsz", type=int, default=1024)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--candidate-confidence-fire",
+        type=float,
+        help="Override the fire confidence threshold from the temporal config",
+    )
+    parser.add_argument(
+        "--candidate-confidence-smoke",
+        type=float,
+        help="Override the smoke confidence threshold from the temporal config",
+    )
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--save", help="Optional annotated video output path")
     parser.add_argument("--events", help="Optional JSONL trigger event output path")
+    parser.add_argument(
+        "--transcode-cache",
+        help="Cache directory for AVI codecs that are unsafe in the OpenCV backend",
+    )
+    parser.add_argument(
+        "--force-transcode",
+        action="store_true",
+        help="Normalize a local video through FFmpeg before opening it",
+    )
+    parser.add_argument("--verifier-config", default="config/verifier.yaml")
+    parser.add_argument("--verifier-weights", help="Enable second-stage verification")
+    parser.add_argument("--verifier-device", help="Verifier device, e.g. cuda:0 or cpu")
+    parser.add_argument("--verifier-threshold-fire", type=float)
+    parser.add_argument("--verifier-threshold-smoke", type=float)
+    parser.add_argument(
+        "--candidate-dir",
+        help="Export triggered clips for later manual labeling",
+    )
     return parser.parse_args()
 
 
 def source_value(raw: str) -> str | int:
     return int(raw) if raw.isdigit() else raw
+
+
+def override_candidate_confidence(
+    config: PostprocessorConfig,
+    fire: float | None = None,
+    smoke: float | None = None,
+) -> PostprocessorConfig:
+    overrides = {"fire": fire, "smoke": smoke}
+    invalid = {
+        name: value
+        for name, value in overrides.items()
+        if value is not None and not 0.0 <= value <= 1.0
+    }
+    if invalid:
+        values = ", ".join(f"{name}={value}" for name, value in invalid.items())
+        raise ValueError(f"candidate confidence must be in [0, 1]: {values}")
+    thresholds = dict(config.candidate_confidence)
+    thresholds.update(
+        {name: value for name, value in overrides.items() if value is not None}
+    )
+    return replace(config, candidate_confidence=thresholds)
 
 
 def video_timestamp(
@@ -82,25 +133,126 @@ def draw_result(frame: object, process_result: object) -> None:
         )
 
 
+def emit_payload(payload: dict[str, object], event_file: object | None) -> None:
+    line = json.dumps(payload, ensure_ascii=False)
+    print(line, flush=True)
+    if event_file is not None:
+        event_file.write(line + "\n")
+        event_file.flush()
+
+
+def export_candidate(
+    request: object,
+    candidate_dir: Path,
+    source_id: str,
+    source_duration_seconds: float | None,
+) -> None:
+    from video_verifier.data import ManifestRecord, append_manifest, save_request
+
+    safe_event = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.event_id)
+    stamp = int(round(request.timestamps[-1] * 1000.0))
+    sample_name = f"{safe_event}_{stamp:012d}.npz"
+    sample_path = candidate_dir / "samples" / sample_name
+    save_request(sample_path, request)
+    append_manifest(
+        candidate_dir / "manifest.jsonl",
+        ManifestRecord(
+            sample=str(Path("samples") / sample_name),
+            source_id=source_id,
+            split="unlabeled",
+            candidate_class=request.candidate_class,
+            label=None,
+            license=None,
+            source_duration_seconds=source_duration_seconds,
+        ),
+    )
+
+
 def main() -> int:
     import cv2
+
+    from checkpoint_compat import install_pathlib_checkpoint_compat
+
+    install_pathlib_checkpoint_compat()
     from ultralytics import YOLO
 
     args = parse_args()
     if args.inference_fps <= 0.0:
         raise ValueError("--inference-fps must be positive")
 
-    source = source_value(args.source)
+    original_source = source_value(args.source)
+    prepared_source = prepare_video_source(
+        original_source,
+        cache_dir=args.transcode_cache,
+        force_transcode=args.force_transcode,
+    )
+    source = prepared_source.value
+    if prepared_source.transcoded:
+        print(
+            f"Using FFmpeg-normalized source for OpenCV: {args.source} -> {source}",
+            file=sys.stderr,
+            flush=True,
+        )
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
+        prepared_source.cleanup()
         raise RuntimeError(f"cannot open source: {args.source}")
 
     model = YOLO(args.model)
     config = load_config(args.config)
     if args.temporal is not None:
         config = replace(config, temporal_mode=args.temporal)
+    config = override_candidate_confidence(
+        config,
+        fire=args.candidate_confidence_fire,
+        smoke=args.candidate_confidence_smoke,
+    )
     postprocessor = FireSmokePostprocessor(config)
+    verifier_config = None
+    clip_builder = None
+    video_buffer = None
+    predictor = None
+    sessions = None
+    candidate_dir = Path(args.candidate_dir) if args.candidate_dir else None
+    if args.verifier_weights or candidate_dir is not None:
+        from video_verifier import (
+            ClipBuilder,
+            VerificationSessionManager,
+            VideoRingBuffer,
+            load_verifier_config,
+        )
+
+        verifier_config = load_verifier_config(args.verifier_config)
+        clip_builder = ClipBuilder(verifier_config)
+        video_buffer = VideoRingBuffer(verifier_config)
+    if args.verifier_weights:
+        from video_verifier import VerifierPredictor
+
+        threshold_overrides = {
+            name: value
+            for name, value in (
+                ("fire", args.verifier_threshold_fire),
+                ("smoke", args.verifier_threshold_smoke),
+            )
+            if value is not None
+        }
+        predictor = VerifierPredictor(
+            args.verifier_weights,
+            verifier_config,
+            device=args.verifier_device,
+            threshold_overrides=threshold_overrides,
+        )
+        sessions = VerificationSessionManager(predictor.runtime_config)
+        verifier_config = predictor.runtime_config
+    elif candidate_dir is not None:
+        sessions = VerificationSessionManager(verifier_config)
     source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+    source_frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    source_duration_seconds = (
+        source_frame_count / source_fps
+        if source_fps > 0.0 and source_frame_count > 0.0
+        else None
+    )
     output_fps = source_fps if source_fps > 0.0 else 25.0
     writer = None
     event_file = None
@@ -119,6 +271,8 @@ def main() -> int:
             if not ok:
                 break
             timestamp = video_timestamp(capture, source, frame_index, source_fps, started_at)
+            if video_buffer is not None:
+                video_buffer.append(frame, timestamp)
             if timestamp + 1e-9 >= next_inference_at:
                 prediction = model.predict(
                     frame,
@@ -130,15 +284,74 @@ def main() -> int:
                 last_process_result = postprocessor.process_ultralytics(
                     prediction, args.camera_id, timestamp
                 )
-                next_inference_at = timestamp + 1.0 / args.inference_fps
+                track_by_id = {
+                    track.track_id: track for track in last_process_result.tracks
+                }
                 for event in last_process_result.events:
                     payload = asdict(event)
                     payload["reason"] = event.reason.value
-                    line = json.dumps(payload, ensure_ascii=False)
-                    print(line, flush=True)
-                    if event_file is not None:
-                        event_file.write(line + "\n")
-                        event_file.flush()
+                    emit_payload(payload, event_file)
+                    if sessions is not None:
+                        started_session = sessions.start(
+                            event, track_by_id.get(event.track_id)
+                        )
+                        if started_session is None:
+                            emit_payload(
+                                {
+                                    "message_type": "verification_suppressed",
+                                    "event_id": event.event_key,
+                                    "candidate_class": event.class_name,
+                                    "reason": "alarm_cooldown",
+                                    "timestamp": timestamp,
+                                },
+                                event_file,
+                            )
+
+                if sessions is not None:
+                    for session in sessions.due(timestamp, track_by_id.values(), args.camera_id):
+                        track = track_by_id.get(session.track_id) or session.last_track
+                        if track is None:
+                            continue
+                        try:
+                            request = clip_builder.build(
+                                video_buffer, track, session.event_id, timestamp
+                            )
+                            if candidate_dir is not None:
+                                export_candidate(
+                                    request,
+                                    candidate_dir,
+                                    str(args.source),
+                                    source_duration_seconds,
+                                )
+                            if predictor is None:
+                                continue
+                            verification = predictor.predict(request)
+                        except RuntimeError as exc:
+                            emit_payload(
+                                {
+                                    "message_type": "verification_error",
+                                    "event_id": session.event_id,
+                                    "error": str(exc),
+                                },
+                                event_file,
+                            )
+                            continue
+                        verification_payload = asdict(verification)
+                        verification_payload["message_type"] = "verification"
+                        verification_payload["timestamp"] = timestamp
+                        emit_payload(verification_payload, event_file)
+                        alarm = sessions.record(verification, timestamp)
+                        if alarm is not None:
+                            alarm_payload = asdict(alarm)
+                            alarm_payload["message_type"] = "alarm"
+                            emit_payload(alarm_payload, event_file)
+
+                active_fps = (
+                    verifier_config.verification_fps
+                    if sessions is not None and sessions.has_active
+                    else args.inference_fps
+                )
+                next_inference_at = timestamp + 1.0 / active_fps
 
             if last_process_result is not None:
                 draw_result(frame, last_process_result)
@@ -159,7 +372,7 @@ def main() -> int:
                 writer.write(frame)
 
             if args.show:
-                cv2.imshow("Fire/Smoke TPT", frame)
+                cv2.imshow("Fire/Smoke Detection", frame)
                 if cv2.waitKey(1) & 0xFF in (27, ord("q")):
                     break
             frame_index += 1
@@ -171,6 +384,7 @@ def main() -> int:
             event_file.close()
         if args.show:
             cv2.destroyAllWindows()
+        prepared_source.cleanup()
     return 0
 
 

@@ -14,6 +14,7 @@ class TrackerConfig:
     max_missed_seconds: float = 1.0
     max_history: int = 64
     max_timestamp_gap: float = 5.0
+    prediction_horizon_seconds: float = 0.75
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.iou_threshold <= 1.0:
@@ -22,8 +23,12 @@ class TrackerConfig:
             raise ValueError("center_distance_threshold must be non-negative")
         if self.max_misses < 0 or self.max_missed_seconds < 0.0:
             raise ValueError("miss limits must be non-negative")
-        if self.max_history <= 0 or self.max_timestamp_gap <= 0.0:
-            raise ValueError("history and timestamp gap must be positive")
+        if (
+            self.max_history <= 0
+            or self.max_timestamp_gap <= 0.0
+            or self.prediction_horizon_seconds < 0.0
+        ):
+            raise ValueError("history, timestamp gap, and prediction horizon are invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +60,37 @@ def normalized_center_distance(first: BBox, second: BBox) -> float:
     return distance / scale
 
 
+def predicted_bbox(track: Track, timestamp: float, horizon: float) -> BBox:
+    detected = [item for item in track.observations if item.detected and item.bbox]
+    if len(detected) < 2 or horizon <= 0.0:
+        return track.bbox
+    previous, latest = detected[-2:]
+    elapsed = latest.timestamp - previous.timestamp
+    if elapsed <= 1e-9:
+        return track.bbox
+    forward = min(max(timestamp - latest.timestamp, 0.0), horizon) / elapsed
+    previous_x = (previous.bbox[0] + previous.bbox[2]) / 2.0
+    previous_y = (previous.bbox[1] + previous.bbox[3]) / 2.0
+    latest_x = (latest.bbox[0] + latest.bbox[2]) / 2.0
+    latest_y = (latest.bbox[1] + latest.bbox[3]) / 2.0
+    center_x = latest_x + forward * (latest_x - previous_x)
+    center_y = latest_y + forward * (latest_y - previous_y)
+    previous_width = previous.bbox[2] - previous.bbox[0]
+    previous_height = previous.bbox[3] - previous.bbox[1]
+    latest_width = latest.bbox[2] - latest.bbox[0]
+    latest_height = latest.bbox[3] - latest.bbox[1]
+    width = max(2.0, latest_width + forward * (latest_width - previous_width))
+    height = max(2.0, latest_height + forward * (latest_height - previous_height))
+    return (
+        center_x - width / 2.0,
+        center_y - height / 2.0,
+        center_x + width / 2.0,
+        center_y + height / 2.0,
+    )
+
+
 class MultiCameraTracker:
-    """Class-aware greedy tracker isolated by camera."""
+    """Class-aware motion-assisted greedy tracker isolated by camera."""
 
     def __init__(self, config: TrackerConfig | None = None) -> None:
         self.config = config or TrackerConfig()
@@ -95,22 +129,34 @@ class MultiCameraTracker:
 
         pairs: list[tuple[float, int, int]] = []
         for track_id, track in camera_tracks.items():
+            expected_bbox = predicted_bbox(
+                track, timestamp, self.config.prediction_horizon_seconds
+            )
             for detection_index, detection in enumerate(detections):
                 if track.class_name != detection.class_name:
                     continue
-                iou = bbox_iou(track.bbox, detection.bbox)
-                center_distance = normalized_center_distance(track.bbox, detection.bbox)
+                iou = max(
+                    bbox_iou(track.bbox, detection.bbox),
+                    bbox_iou(expected_bbox, detection.bbox),
+                )
+                center_distance = min(
+                    normalized_center_distance(track.bbox, detection.bbox),
+                    normalized_center_distance(expected_bbox, detection.bbox),
+                )
                 if iou >= self.config.iou_threshold:
                     score = 2.0 + iou
                 elif center_distance <= self.config.center_distance_threshold:
                     score = 1.0 / (1.0 + center_distance)
                 else:
                     continue
+                score += min(track.hit_count, 10) * 0.01
                 pairs.append((score, track_id, detection_index))
 
         matched_tracks: set[int] = set()
         matched_detections: set[int] = set()
-        for _, track_id, detection_index in sorted(pairs, reverse=True):
+        for _, track_id, detection_index in sorted(
+            pairs, key=lambda item: (-item[0], item[1], item[2])
+        ):
             if track_id in matched_tracks or detection_index in matched_detections:
                 continue
             camera_tracks[track_id].record_detection(

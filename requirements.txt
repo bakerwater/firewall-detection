@@ -1,3 +1,7 @@
 ultralytics
 opencv-python
 PyYAML
+
+numpy
+torch>=2.2
+torchvision>=0.17

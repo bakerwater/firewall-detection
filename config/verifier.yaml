@@ -1,0 +1,30 @@
+clip:
+  seconds: 3.2
+  buffer_fps: 10.0
+  frames: 32
+  rgb_frames: 16
+  image_size: 224
+  roi_scale: 1.5
+
+frequency:
+  minimum_fps: 8.0
+  minimum_frames: 26
+  maximum_frame_gap: 0.25
+
+verification_fps: 10.0
+
+voting:
+  stride_seconds: 0.5
+  window: 3
+  minimum_positive: 2
+  maximum_seconds: 10.0
+  track_grace_seconds: 1.25
+  reassociation_iou: 0.05
+  reassociation_center_distance: 1.0
+  alarm_cooldown_seconds: 10.0
+  global_alarm_cooldown_seconds: 10.0
+
+# Replace these with thresholds calibrated on an independent validation set.
+thresholds:
+  fire: 0.5
+  smoke: 0.5
