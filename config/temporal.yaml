@@ -1,0 +1,54 @@
+# Select one temporal gate: tpt or avt.
+temporal_mode: avt
+
+tracker:
+  iou_threshold: 0.15
+  center_distance_threshold: 1.5
+  max_misses: 2
+  max_missed_seconds: 1.0
+  max_history: 64
+  max_timestamp_gap: 5.0
+
+candidate_confidence:
+  fire: 0.60
+  smoke: 0.20
+default_candidate_confidence: 0.25
+
+classes:
+  fire:
+    window_size: 3
+    min_hits: 2
+    min_track_duration: 1.0
+    min_confidence: 0.25
+    high_confidence: 0.80
+    max_misses: 1
+  smoke:
+    window_size: 5
+    min_hits: 3
+    min_track_duration: 2.0
+    min_confidence: 0.25
+    high_confidence: 0.85
+    max_misses: 2
+# AVT follows the original repository defaults. The coefficient of variation is
+# population_std(bbox_area) / mean(bbox_area) over the most recent samples.
+avt_classes:
+  fire:
+    window_size: 20
+    area_threshold: 0.05
+    min_samples: 2
+    min_track_duration: 0.0
+  smoke:
+    window_size: 20
+    area_threshold: 0.05
+    min_samples: 2
+    min_track_duration: 0.0
+
+
+# Region coordinates are normalized to [0, 1] by default. A detection is ignored
+# when its bbox center falls inside a matching region.
+ignore_regions: []
+# Example:
+#  - camera_id: camera_001
+#    class_name: fire
+#    bbox: [0.0, 0.0, 0.15, 0.20]
+#    normalized: true

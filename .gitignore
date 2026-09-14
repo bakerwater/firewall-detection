@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+
+# Local video dataset and runtime outputs
+/dataset/
+/evaluation_results/
+*.avi
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.jsonl
+
+# Keep only the deployable YOLO weight from the training run
+/yolo26s-p2-1024-recall/*
+!/yolo26s-p2-1024-recall/weights/
+/yolo26s-p2-1024-recall/weights/*
+!/yolo26s-p2-1024-recall/weights/best.pt
